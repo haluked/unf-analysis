@@ -23,6 +23,7 @@ import csv
 import queue
 import shutil
 import threading
+import traceback
 import webbrowser
 from datetime import datetime
 
@@ -162,43 +163,102 @@ class InstagramAutomation:
         except Exception:
             pass
 
+        try:
+            self.driver.set_script_timeout(30)
+        except Exception:
+            pass
+
         return self.driver
 
-    def check_is_logged_in(self, timeout=8):
+    def dismiss_popups(self):
+        """Dismiss common Instagram popups (cookie banners, save login info, notifications)."""
+        if not self.driver:
+            return
+
+        # 1. Cookie consent dialog
+        cookie_xpaths = [
+            "//button[text()='Allow all cookies' or text()='Tüm çerezlere izin ver' or text()='Accept' or text()='Kabul Et' or contains(text(), 'Allow all')]",
+            "//button[contains(text(), 'Decline optional cookies') or contains(text(), 'Gerekli olmayanları reddet')]",
+            "//button[contains(text(), 'Allow') or contains(text(), 'İzin') or contains(text(), 'Accept') or contains(text(), 'Kabul')]"
+        ]
+        for xp in cookie_xpaths:
+            try:
+                for btn in self.driver.find_elements(By.XPATH, xp):
+                    if btn.is_displayed():
+                        self.driver.execute_script("arguments[0].click();", btn)
+                        time.sleep(0.3)
+                        break
+            except Exception:
+                pass
+
+        # 2. "Save Info" / "Notifications" dialogs
+        not_now_xpaths = [
+            "//button[text()='Not Now' or text()='Şimdi Değil' or text()='Not now']",
+            "//div[@role='button' and (text()='Not Now' or text()='Şimdi Değil' or text()='Not now')]",
+            "//button[contains(text(), 'Not Now') or contains(text(), 'Şimdi Değil')]"
+        ]
+        for xp in not_now_xpaths:
+            try:
+                for btn in self.driver.find_elements(By.XPATH, xp):
+                    if btn.is_displayed():
+                        self.driver.execute_script("arguments[0].click();", btn)
+                        time.sleep(0.3)
+                        break
+            except Exception:
+                pass
+
+    def check_is_logged_in(self, timeout=5):
         """Determines if the user has an active Instagram session."""
         if not self.driver:
             return False
+
+        # If on explicit login or onboarding url
         try:
+            curr_url = self.driver.current_url.lower()
+            if "instagram.com/accounts/login" in curr_url or "instagram.com/accounts/onetap" in curr_url:
+                return False
+        except Exception:
+            pass
+
+        # 1. Fast check: presence of sessionid cookie
+        try:
+            cookies = self.driver.get_cookies()
+            for c in cookies:
+                if c.get("name") == "sessionid" and c.get("value"):
+                    return True
+        except Exception:
+            pass
+
+        # 2. Check DOM navigation indicators (side nav, direct inbox, profile, search)
+        try:
+            nav_xpath = (
+                "//nav | "
+                "//a[contains(@href, '/direct/inbox')] | "
+                "//a[contains(@href, '/explore')] | "
+                "//*[contains(@aria-label, 'Home') or contains(@aria-label, 'Ana Sayfa') or "
+                "contains(@aria-label, 'Direct') or contains(@aria-label, 'Messages') or "
+                "contains(@aria-label, 'Search') or contains(@aria-label, 'Ara') or "
+                "contains(@aria-label, 'Profile') or contains(@aria-label, 'Profil')]"
+            )
             WebDriverWait(self.driver, timeout).until(
-                EC.presence_of_element_located((
-                    By.XPATH,
-                    "//*[contains(@aria-label, 'Home') or contains(@aria-label, 'Ana Sayfa') or "
-                    "contains(@aria-label, 'Search') or contains(@aria-label, 'Ara') or "
-                    "contains(@aria-label, 'Direct') or contains(@aria-label, 'Messages') or "
-                    "contains(@aria-label, 'Profil') or contains(@aria-label, 'Profile') or "
-                    "//a[contains(@href, '/direct/inbox')]]"
-                ))
+                EC.presence_of_element_located((By.XPATH, nav_xpath))
             )
             return True
-        except TimeoutException:
-            # Also check if login form elements exist
+        except Exception:
+            pass
+
+        # 3. Check absence of login forms
+        try:
             login_forms = self.driver.find_elements(By.NAME, "username")
-            return len(login_forms) == 0 and "instagram.com/accounts/login" not in self.driver.current_url
+            return len(login_forms) == 0 and "instagram.com/accounts/login" not in self.driver.current_url.lower()
+        except Exception:
+            return False
 
     def perform_login(self, username, password):
         """Attempts to log in with provided credentials if required."""
         self.driver.get("https://www.instagram.com/accounts/login/")
         time.sleep(3)
-
-        # Handle cookie banner if present
-        try:
-            cookie_btn = WebDriverWait(self.driver, 4).until(
-                EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Allow') or contains(text(), 'İzin') or contains(text(), 'Accept') or contains(text(), 'Kabul')]"))
-            )
-            cookie_btn.click()
-            time.sleep(1)
-        except Exception:
-            pass
+        self.dismiss_popups()
 
         if self.check_is_logged_in(timeout=3):
             self.log("Existing active session found! Skipping login form.")
@@ -224,6 +284,7 @@ class InstagramAutomation:
             # Wait up to 15 seconds for login completion
             for _ in range(15):
                 time.sleep(1)
+                self.dismiss_popups()
                 if self.check_is_logged_in(timeout=2):
                     self.log("Successfully logged in!")
                     return True
@@ -232,7 +293,6 @@ class InstagramAutomation:
             if "checkpoint" in self.driver.current_url or "two_factor" in self.driver.current_url:
                 self.log("Two-Factor Authentication (2FA) or Security Check detected!")
                 self.log("Please complete the challenge in the browser window...")
-                # Give user 60 seconds to solve 2FA
                 for _ in range(60):
                     time.sleep(1)
                     if self.check_is_logged_in(timeout=2):
@@ -244,44 +304,229 @@ class InstagramAutomation:
             self.log(f"Login failed: {e}")
             return False
 
-    def extract_users_from_modal(self, target_username, list_type, progress_callback=None, stop_event=None, max_attempts=8):
+    def try_extract_via_api(self, target_username, list_type, progress_callback=None, stop_event=None):
+        """
+        Attempts direct high-speed session API extraction via the authenticated browser context.
+        Returns set of usernames on success, or None if the API cannot be used.
+        """
+        if not self.driver:
+            return None
+
+        # Ensure we are on an instagram page
+        try:
+            if "instagram.com" not in self.driver.current_url:
+                self.driver.get("https://www.instagram.com/")
+                time.sleep(2)
+        except Exception:
+            return None
+
+        self.log(f"Attempting high-speed session API query for {list_type}...")
+
+        # Step 1: Resolve target user ID
+        target_user_id = None
+        try:
+            cookies = {c['name']: c['value'] for c in self.driver.get_cookies()}
+            logged_in_uid = cookies.get('ds_user_id')
+        except Exception:
+            logged_in_uid = None
+
+        # Fetch user info via web_profile_info
+        resolve_script = """
+        const callback = arguments[arguments.length - 1];
+        const targetUser = arguments[0];
+        fetch(`https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(targetUser)}`, {
+            headers: {
+                'X-IG-App-ID': '936619743392459',
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            credentials: 'include'
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data && data.data && data.data.user && data.data.user.id) {
+                callback({ success: true, userId: data.data.user.id });
+            } else {
+                callback({ success: false, error: 'User ID not found' });
+            }
+        })
+        .catch(e => callback({ success: false, error: String(e) }));
+        """
+
+        try:
+            result = self.driver.execute_async_script(resolve_script, target_username)
+            if result and result.get("success"):
+                target_user_id = result.get("userId")
+        except Exception as e:
+            self.log(f"Could not resolve user ID via API: {e}")
+
+        if not target_user_id and logged_in_uid:
+            target_user_id = logged_in_uid
+
+        if not target_user_id:
+            self.log("Session API endpoint unavailable. Continuing with DOM virtualizer...")
+            return None
+
+        # Step 2: Fetch pagination
+        collected = set()
+        cursor = None
+        page_script = """
+        const callback = arguments[arguments.length - 1];
+        const userId = arguments[0];
+        const listType = arguments[1];
+        const cursor = arguments[2];
+        let url = `https://www.instagram.com/api/v1/friendships/${userId}/${listType}/?count=50`;
+        if (cursor) {
+            url += `&max_id=${encodeURIComponent(cursor)}`;
+        }
+
+        fetch(url, {
+            headers: {
+                'X-IG-App-ID': '936619743392459',
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            credentials: 'include'
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data && data.status === 'ok' && Array.isArray(data.users)) {
+                const names = data.users.map(u => u.username).filter(Boolean);
+                callback({
+                    success: true,
+                    users: names,
+                    next_cursor: data.next_max_id || null,
+                    big_list: data.big_list || false
+                });
+            } else {
+                callback({ success: false, error: data ? (data.message || 'Non-ok status') : 'No response' });
+            }
+        })
+        .catch(e => callback({ success: false, error: String(e) }));
+        """
+
+        while True:
+            if stop_event and stop_event.is_set():
+                break
+
+            try:
+                res = self.driver.execute_async_script(page_script, target_user_id, list_type, cursor)
+            except Exception as e:
+                self.log(f"API query interrupted: {e}")
+                break
+
+            if not res or not res.get("success"):
+                err = res.get("error") if res else "unknown"
+                if len(collected) == 0:
+                    self.log(f"API request returned error: {err}. Falling back to DOM...")
+                    return None
+                else:
+                    self.log(f"API pagination reached limit: {err}.")
+                    break
+
+            new_batch = res.get("users", [])
+            prev_len = len(collected)
+            for u in new_batch:
+                if (
+                    u
+                    and u not in RESERVED_ROUTES
+                    and u.lower() != target_username.lower()
+                    and not u.isdigit()
+                    and re.match(r'^[a-zA-Z0-9._]+$', u)
+                ):
+                    collected.add(u)
+
+            cur_len = len(collected)
+            delta = cur_len - prev_len
+
+            if progress_callback:
+                progress_callback(list_type, cur_len)
+
+            if delta > 0:
+                self.log(f"[{list_type}] Captured {cur_len} users (+{delta}) via API")
+
+            next_cursor = res.get("next_cursor")
+            if not next_cursor or not new_batch:
+                break
+
+            cursor = next_cursor
+            time.sleep(random.uniform(0.6, 1.1))
+
+        return collected
+
+    def extract_users_from_modal(self, target_username, list_type, progress_callback=None, stop_event=None, max_attempts=16):
         """
         Navigates to the modal dialog for followers/following,
         scrolls through the virtualized DOM, and extracts all clean usernames.
         """
+        # 1. Try fast in-browser authenticated session API first
+        try:
+            api_result = self.try_extract_via_api(target_username, list_type, progress_callback, stop_event)
+            if api_result is not None and len(api_result) > 0:
+                self.log(f"Session API extraction completed: {len(api_result)} unique {list_type}.")
+                return api_result
+        except Exception as e:
+            self.log(f"API extraction skipped: {e}")
+
+        # 2. Modern DOM Virtualizer Fallback
         self.log(f"Navigating to @{target_username} profile...")
         self.driver.get(f"https://www.instagram.com/{target_username}/")
-        time.sleep(4)
+        time.sleep(3)
+        self.dismiss_popups()
 
         # Open the modal
         self.log(f"Opening {list_type} modal...")
         modal_opened = False
         try:
-            wait = WebDriverWait(self.driver, 8)
-            link = wait.until(EC.element_to_be_clickable((By.XPATH, f"//a[contains(@href, '/{list_type}/')]")))
-            link.click()
+            wait = WebDriverWait(self.driver, 6)
+            link = wait.until(EC.element_to_be_clickable((By.XPATH, f"//a[contains(@href, '/{list_type}') or contains(@href, '{list_type}')]")))
+            self.driver.execute_script("arguments[0].click();", link)
             modal_opened = True
-            time.sleep(3)
+            time.sleep(2)
         except Exception:
             self.log(f"Direct click failed. Navigating to https://www.instagram.com/{target_username}/{list_type}/...")
             self.driver.get(f"https://www.instagram.com/{target_username}/{list_type}/")
-            time.sleep(4)
+            time.sleep(3)
             modal_opened = True
+
+        self.dismiss_popups()
 
         # Wait for modal dialog
         try:
-            WebDriverWait(self.driver, 10).until(
+            WebDriverWait(self.driver, 8).until(
                 EC.presence_of_element_located((By.XPATH, "//div[@role='dialog']"))
             )
         except TimeoutException:
-            self.log("Warning: role='dialog' not found, searching main page content...")
+            self.log("Warning: role='dialog' not found, searching page content...")
 
         collected_users = set()
         consecutive_stalls = 0
         scroll_count = 0
-        max_scrolls = 600
+        max_scrolls = 800
 
-        self.log(f"Beginning smart scroll collection for {list_type}...")
+        self.log(f"Beginning smart virtual DOM scroll collection for {list_type}...")
+
+        # Script for high-speed bulk link extraction (runs in 1ms without stale element issues)
+        extract_script = """
+            const dialog = document.querySelector("div[role='dialog']") || document.body;
+            const anchors = dialog.querySelectorAll("a[href]");
+            return Array.from(anchors).map(a => a.href || a.getAttribute('href') || '');
+        """
+
+        # Script for virtual scroll triggering
+        scroll_script = """
+            const dialog = document.querySelector("div[role='dialog']");
+            if (!dialog) return false;
+            const scrollable = dialog.querySelector("div._aano") || Array.from(dialog.querySelectorAll('div')).find(el => {
+                const style = window.getComputedStyle(el);
+                return (style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight;
+            });
+            if (scrollable) {
+                const step = Math.min(700, scrollable.scrollHeight - scrollable.scrollTop);
+                scrollable.scrollTop += (step > 0 ? step : 350);
+                scrollable.dispatchEvent(new Event('scroll', { bubbles: true }));
+                return true;
+            }
+            return false;
+        """
 
         while scroll_count < max_scrolls:
             if stop_event and stop_event.is_set():
@@ -290,34 +535,25 @@ class InstagramAutomation:
 
             scroll_count += 1
 
-            # 1. Harvest links from dialog or page
+            # 1. High-speed bulk link extraction
             try:
-                links = self.driver.find_elements(By.XPATH, "//div[@role='dialog']//a[@href]")
-                if not links:
-                    links = self.driver.find_elements(By.XPATH, "//a[contains(@href, '/') and not(contains(@href, '/p/'))]")
-                
+                raw_hrefs = self.driver.execute_script(extract_script) or []
                 prev_count = len(collected_users)
-                for link in links:
-                    try:
-                        href = link.get_attribute('href')
-                        if not href:
-                            continue
-                        
-                        # Match /username/ pattern
-                        parts = [p for p in href.strip('/').split('/') if p]
-                        if parts:
-                            u = parts[-1]
-                            if (
-                                u not in RESERVED_ROUTES
-                                and u.lower() != target_username.lower()
-                                and not u.isdigit()
-                                and re.match(r'^[a-zA-Z0-9._]+$', u)
-                            ):
-                                collected_users.add(u)
-                    except StaleElementReferenceException:
+
+                for href in raw_hrefs:
+                    if not href:
                         continue
-                    except Exception:
-                        continue
+                    clean_href = href.split('?')[0].split('#')[0].rstrip('/')
+                    parts = [p for p in clean_href.split('/') if p]
+                    if parts:
+                        u = parts[-1]
+                        if (
+                            u not in RESERVED_ROUTES
+                            and u.lower() != target_username.lower()
+                            and not u.isdigit()
+                            and re.match(r'^[a-zA-Z0-9._]+$', u)
+                        ):
+                            collected_users.add(u)
 
                 new_count = len(collected_users)
                 delta = new_count - prev_count
@@ -327,14 +563,13 @@ class InstagramAutomation:
 
                 if delta > 0:
                     consecutive_stalls = 0
-                    if scroll_count % 3 == 0 or delta >= 10:
+                    if scroll_count % 3 == 0 or delta >= 8:
                         self.log(f"[{list_type}] Captured {new_count} users (+{delta})")
                 else:
                     consecutive_stalls += 1
 
-                # If stalled, attempt unstuck scrolling
                 if consecutive_stalls >= max_attempts:
-                    self.log(f"[{list_type}] Reached end of list or rate limit. Total collected: {new_count}")
+                    self.log(f"[{list_type}] Reached end of list. Total collected: {new_count}")
                     break
 
             except Exception as e:
@@ -343,46 +578,46 @@ class InstagramAutomation:
 
             # 2. Perform scrolling
             try:
-                # Execute JavaScript scroll on the scrollable container inside dialog
-                scrolled = self.driver.execute_script("""
-                    const dialog = document.querySelector("div[role='dialog']");
-                    if (!dialog) return false;
-                    const scrollables = Array.from(dialog.querySelectorAll('div')).filter(el => {
-                        const style = window.getComputedStyle(el);
-                        return (style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight;
-                    });
-                    if (scrollables.length > 0) {
-                        const target = scrollables[0];
-                        target.scrollTop = target.scrollHeight;
-                        return true;
-                    }
-                    return false;
-                """)
-
+                scrolled = self.driver.execute_script(scroll_script)
                 if not scrolled:
-                    # Fallback to scrolling last link into view
-                    if links:
-                        self.driver.execute_script("arguments[0].scrollIntoView(false);", links[-1])
-                    else:
-                        actions = webdriver.ActionChains(self.driver)
-                        actions.send_keys(Keys.PAGE_DOWN).perform()
-
-                # If stalled, nudge scroll up slightly then down
-                if consecutive_stalls == 2:
+                    # Fallback to scrollIntoView on last link
                     self.driver.execute_script("""
                         const dialog = document.querySelector("div[role='dialog']");
                         if (dialog) {
-                            const scrollable = Array.from(dialog.querySelectorAll('div')).find(el => el.scrollHeight > el.clientHeight);
-                            if (scrollable) scrollable.scrollTop -= 250;
+                            const anchors = dialog.querySelectorAll("a[href]");
+                            if (anchors.length > 0) {
+                                anchors[anchors.length - 1].scrollIntoView({ behavior: 'smooth', block: 'end' });
+                            }
                         }
                     """)
-                    time.sleep(0.8)
+
+                # Unstuck maneuver if stalled
+                if consecutive_stalls in [2, 5, 8]:
+                    self.driver.execute_script("""
+                        const dialog = document.querySelector("div[role='dialog']");
+                        if (dialog) {
+                            const scrollable = dialog.querySelector("div._aano") || Array.from(dialog.querySelectorAll('div')).find(el => el.scrollHeight > el.clientHeight);
+                            if (scrollable) {
+                                scrollable.scrollTop -= 350;
+                                scrollable.dispatchEvent(new Event('scroll', { bubbles: true }));
+                            }
+                        }
+                    """)
+                    time.sleep(0.5)
+                    # Retry button check
+                    try:
+                        retry_btns = self.driver.find_elements(By.XPATH, "//div[@role='dialog']//button[contains(., 'Retry') or contains(., 'Tekrar') or contains(., 'Yeniden')]")
+                        for rb in retry_btns:
+                            if rb.is_displayed():
+                                self.driver.execute_script("arguments[0].click();", rb)
+                                break
+                    except Exception:
+                        pass
 
             except Exception:
                 pass
 
-            # Random jitter to simulate natural browsing and avoid rate-limiting
-            time.sleep(random.uniform(1.2, 2.0))
+            time.sleep(random.uniform(1.1, 1.8))
 
         self.log(f"Finished {list_type} scan: {len(collected_users)} unique users.")
         return collected_users
@@ -1079,7 +1314,7 @@ class InstaTrackerApp:
 
     # --- WORKER THREAD OPERATIONS ---
     def start_analysis_thread(self):
-        username = self.entry_user.get().strip()
+        username = self.entry_user.get().strip().lstrip('@')
         password = self.entry_pass.get()
 
         if not username:

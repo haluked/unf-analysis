@@ -116,6 +116,54 @@ class TestUnfAnalysis(unittest.TestCase):
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
+    def test_href_extraction_and_cleaning(self):
+        """Test URL parsing, query string stripping, and username validation."""
+        import re
+        sample_hrefs = [
+            "https://www.instagram.com/valid_user_1/?next=%2F",
+            "https://www.instagram.com/valid_user_2#section",
+            "/valid.user.3/",
+            "https://www.instagram.com/p/C_sample_post_id/",
+            "https://www.instagram.com/explore/",
+            "https://www.instagram.com/reels/",
+            "https://www.instagram.com/targetuser/",
+            "https://www.instagram.com/12345678/",
+        ]
+        target_username = "targetuser"
+        extracted = set()
+
+        for href in sample_hrefs:
+            clean_href = href.split("?")[0].split("#")[0].rstrip("/")
+            parts = [p for p in clean_href.split("/") if p]
+            if parts:
+                u = parts[-1]
+                if (
+                    u not in unf_mod.RESERVED_ROUTES
+                    and u.lower() != target_username.lower()
+                    and not u.isdigit()
+                    and re.match(r"^[a-zA-Z0-9._]+$", u)
+                ):
+                    extracted.add(u)
+
+        self.assertIn("valid_user_1", extracted)
+        self.assertIn("valid_user_2", extracted)
+        self.assertIn("valid.user.3", extracted)
+        self.assertNotIn("explore", extracted)
+        self.assertNotIn("reels", extracted)
+        self.assertNotIn("targetuser", extracted)
+        self.assertNotIn("12345678", extracted)
+
+    def test_automation_class_structure(self):
+        """Ensure InstagramAutomation defines all essential modernized methods."""
+        auto = unf_mod.InstagramAutomation("Chrome")
+        self.assertTrue(hasattr(auto, "start_driver"))
+        self.assertTrue(hasattr(auto, "check_is_logged_in"))
+        self.assertTrue(hasattr(auto, "dismiss_popups"))
+        self.assertTrue(hasattr(auto, "perform_login"))
+        self.assertTrue(hasattr(auto, "try_extract_via_api"))
+        self.assertTrue(hasattr(auto, "extract_users_from_modal"))
+        self.assertTrue(hasattr(auto, "close"))
+
 
 if __name__ == "__main__":
     unittest.main()
